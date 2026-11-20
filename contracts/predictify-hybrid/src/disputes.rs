@@ -1,5 +1,5 @@
 use crate::errors::Error;
-use crate::storage::{AdminStorage, MarketStateManager, TokenStorage};
+use crate::storage::{AdminStorage, DataKey, MarketStateManager, TokenStorage};
 use crate::types::{
     Dispute, DisputeEscalation, DisputeFeeDistribution, DisputeResolution, DisputeStats,
     DisputeStatus, DisputeTimeout, DisputeTimeoutOutcome, DisputeTimeoutStatus, Market,
@@ -1015,7 +1015,7 @@ impl DisputeManager {
             0
         };
 
-        for i in start_idx..history.len().saturating_sub(1) {
+        for i in start_idx..history.len() {
             if let Some(prev_dispute) = history.get(i) {
                 if prev_dispute.user != user {
                     let stake_diff = if prev_dispute.stake > stake { prev_dispute.stake - stake } else { stake - prev_dispute.stake };
@@ -1308,15 +1308,23 @@ impl DisputeManager {
     /// - **Quality Metrics**: Assess market and oracle performance
     pub fn get_market_disputes(env: &Env, market_id: Symbol) -> Result<Vec<Dispute>, Error> {
         let market = MarketStateManager::get_market(env, &market_id)?;
-        let mut history = env.storage().persistent()
-            .get::<_, Vec<Dispute>>(&DataKey::DisputeHistory(market_id.clone()))
-            .unwrap_or_else(|| Vec::new(env));
+        let history_key = DataKey::DisputeHistory(market_id.clone());
+        let stored_history = env
+            .storage()
+            .persistent()
+            .get::<_, Vec<Dispute>>(&history_key);
+        if stored_history.is_some() {
+            env.storage()
+                .persistent()
+                .extend_ttl(&history_key, 535680, 535680);
+        }
+        let mut history = stored_history.unwrap_or_else(|| Vec::new(env));
 
         if history.is_empty() {
             let extracted = DisputeUtils::extract_disputes_from_market(env, &market, market_id.clone());
             if extracted.len() > 0 {
-                env.storage().persistent().set(&DataKey::DisputeHistory(market_id.clone()), &extracted);
-                env.storage().persistent().extend_ttl(&DataKey::DisputeHistory(market_id.clone()), 535680, 535680);
+                env.storage().persistent().set(&history_key, &extracted);
+                env.storage().persistent().extend_ttl(&history_key, 535680, 535680);
                 return Ok(extracted);
             }
         }
@@ -2150,24 +2158,25 @@ impl DisputeManager {
     /// # Errors
     ///
     /// - [`Error::ConfigNotFound`] — voting record not found
-    pub fn determine_timeout_outcome(
+  pub fn determine_timeout_outcome(
         env: &Env,
         dispute_id: Symbol,
     ) -> Result<DisputeTimeoutOutcome, Error> {
-        // Get dispute voting data
         let voting_data = DisputeUtils::get_dispute_voting(env, &dispute_id)?;
+        let timeout = DisputeUtils::get_dispute_timeout(env, &dispute_id)?;
 
-        // Determine outcome based on stake-weighted voting
-        let outcome = if voting_data.total_support_stake > voting_data.total_against_stake {
+        // Minimal check: if zero votes, explicitly treat outcome as expired/against
+        let outcome = if voting_data.total_support_stake == 0 && voting_data.total_against_stake == 0 {
+            String::from_str(env, "Against") // Or your zero-vote fallback
+        } else if voting_data.total_support_stake > voting_data.total_against_stake {
             String::from_str(env, "Support")
         } else {
             String::from_str(env, "Against")
         };
 
-        // Create timeout outcome
         let timeout_outcome = DisputeTimeoutOutcome {
             dispute_id: dispute_id.clone(),
-            market_id: Symbol::new(env, ""), // Will be set properly
+            market_id: timeout.market_id, // Fixes the empty symbol bug too
             outcome,
             resolution_method: String::from_str(env, "Timeout Auto-Resolution"),
             resolution_timestamp: env.ledger().timestamp(),
@@ -3376,23 +3385,33 @@ impl DisputeAnalytics {
         (weight * 100.0) as i128
     }
 
-    /// Determine which outcome the community favours by summing stake-weighted votes.
+    /// Determine which outcome the community favours using **stake-weighted**
+    /// voting (Issue #031).
     ///
-    /// Returns a [`CommunityConsensus`] with the winning outcome, the
-    /// confidence as an integer percentage, and the total vote stake.
+    /// Each voter's influence is proportional to the amount they staked, not
+    /// the number of addresses that voted. This prevents a sybil-style attack
+    /// where many low-stake addresses outvote a single high-economic-exposure
+    /// participant.
+    ///
+    /// Returns a [`CommunityConsensus`] where:
+    /// - `outcome` is the outcome with the highest total backing stake.
+    /// - `confidence` is `(max_outcome_stake * 100) / total_stake` (0–100).
+    /// - `total_votes` is the sum of all staked amounts across all outcomes.
     pub fn calculate_community_consensus(env: &Env, market: &Market) -> CommunityConsensus {
-        let mut outcome_totals = Map::new(env);
-        let mut total_votes = 0;
+        // Accumulate total stake per outcome.
+        let mut outcome_totals: Map<String, i128> = Map::new(env);
+        let mut total_stake: i128 = 0;
 
         for (user, outcome) in market.votes.iter() {
             let stake = market.stakes.get(user).unwrap_or(0);
             let current_total = outcome_totals.get(outcome.clone()).unwrap_or(0);
-            outcome_totals.set(outcome, current_total + stake);
-            total_votes += stake;
+            outcome_totals.set(outcome.clone(), current_total + stake);
+            total_stake += stake;
         }
 
+        // Find the leading outcome by total staked weight.
         let mut winning_outcome = String::from_str(env, "");
-        let mut max_stake = 0;
+        let mut max_stake: i128 = 0;
 
         for (outcome, stake) in outcome_totals.iter() {
             if stake > max_stake {
@@ -3401,8 +3420,9 @@ impl DisputeAnalytics {
             }
         }
 
-        let confidence = if total_votes > 0 {
-            (max_stake as i128) * 100 / total_votes
+        // Confidence = fraction of total stake behind the winning outcome.
+        let confidence: i128 = if total_stake > 0 {
+            (max_stake * 100) / total_stake
         } else {
             0
         };
@@ -3410,7 +3430,7 @@ impl DisputeAnalytics {
         CommunityConsensus {
             outcome: winning_outcome,
             confidence,
-            total_votes,
+            total_votes: total_stake,
         }
     }
 
@@ -3660,7 +3680,7 @@ pub struct CommunityConsensus {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use soroban_sdk::testutils::Address as _;
+    use soroban_sdk::testutils::{Address as _, Ledger};
 
     fn create_test_market(env: &Env, end_time: u64) -> Market {
         let mut outcomes = Vec::new(env);
@@ -4497,6 +4517,98 @@ mod tests {
             assert!(DisputeManager::get_history_cap(&env).is_none());
             DisputeManager::set_history_cap(&env, admin.clone(), 5).unwrap();
             assert_eq!(DisputeManager::get_history_cap(&env), Some(5));
+        });
+    }
+
+    #[test]
+    fn test_get_market_disputes_with_no_history() {
+        let env = Env::default();
+        let contract_id = env.register(crate::PredictifyHybrid, ());
+        let market_id = Symbol::new(&env, "market_no_disputes");
+        let market = create_test_market(&env, env.ledger().timestamp() + 86400);
+
+        env.as_contract(&contract_id, || {
+            MarketStateManager::update_market(&env, &market_id, &market);
+            let disputes = DisputeManager::get_market_disputes(&env, market_id.clone()).unwrap();
+            assert!(disputes.is_empty());
+
+            let missing_market = Symbol::new(&env, "missing_market");
+            assert!(matches!(
+                DisputeManager::get_market_disputes(&env, missing_market),
+                Err(Error::MarketNotFound)
+            ));
+        });
+    }
+
+    #[test]
+    fn test_get_market_disputes_returns_replacement_for_same_market_key() {
+        let env = Env::default();
+        let contract_id = env.register(crate::PredictifyHybrid, ());
+        let market_id = Symbol::new(&env, "market_replaced");
+        let market = create_test_market(&env, env.ledger().timestamp() + 86400);
+        let original = testing::create_test_dispute(
+            &env,
+            Address::generate(&env),
+            market_id.clone(),
+            MIN_DISPUTE_STAKE,
+        );
+        let replacement_user = Address::generate(&env);
+        let replacement = testing::create_test_dispute(
+            &env,
+            replacement_user.clone(),
+            market_id.clone(),
+            MIN_DISPUTE_STAKE * 2,
+        );
+
+        env.as_contract(&contract_id, || {
+            MarketStateManager::update_market(&env, &market_id, &market);
+            let history_key = DataKey::DisputeHistory(market_id.clone());
+            let mut original_history = Vec::new(&env);
+            original_history.push_back(original);
+            env.storage().persistent().set(&history_key, &original_history);
+
+            let mut replacement_history = Vec::new(&env);
+            replacement_history.push_back(replacement);
+            env.storage()
+                .persistent()
+                .set(&history_key, &replacement_history);
+
+            let disputes = DisputeManager::get_market_disputes(&env, market_id).unwrap();
+            let stored = disputes.get(0).unwrap();
+            assert_eq!(stored.user, replacement_user);
+            assert_eq!(stored.stake, MIN_DISPUTE_STAKE * 2);
+        });
+    }
+
+    #[test]
+    fn test_get_market_disputes_extends_history_ttl_on_read() {
+        let env = Env::default();
+        let contract_id = env.register(crate::PredictifyHybrid, ());
+        let market_id = Symbol::new(&env, "market_history_ttl");
+        let market = create_test_market(&env, env.ledger().timestamp() + 86400);
+        let dispute = testing::create_test_dispute(
+            &env,
+            Address::generate(&env),
+            market_id.clone(),
+            MIN_DISPUTE_STAKE,
+        );
+
+        env.as_contract(&contract_id, || {
+            MarketStateManager::update_market(&env, &market_id, &market);
+            let key = DataKey::DisputeHistory(market_id.clone());
+            let mut history = Vec::new(&env);
+            history.push_back(dispute);
+            env.storage().persistent().set(&key, &history);
+
+            env.ledger().with_mut(|ledger| ledger.sequence_number += 10);
+            let ttl_before_read = env.storage().persistent().get_ttl(&key);
+            DisputeManager::get_market_disputes(&env, market_id).unwrap();
+            let ttl_after_read = env.storage().persistent().get_ttl(&key);
+
+            assert!(
+                ttl_after_read > ttl_before_read,
+                "reading stored dispute history should extend its TTL"
+            );
         });
     }
 

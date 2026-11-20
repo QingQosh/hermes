@@ -32,7 +32,7 @@ individual contract calls and survive across ledger upgrades.
 | `Symbol("recovery_records")` | `Map<Symbol, MarketRecovery>` | Persistent | `RECOVERY_TTL_LEDGERS` | Active (unresolved) recovery records per market. Split from history during the v2 migration so that queries for current state are cheap. |
 | `Symbol("recovery_status_map")` | `Map<Symbol, String>` | Persistent | `RECOVERY_TTL_LEDGERS` | Quick-lookup status endpoint (`"pending"` / `"recovered"`) without deserialising the full `MarketRecovery` struct. |
 | `Symbol("recovery_v2_migrated")` | `bool` | Persistent | `RECOVERY_TTL_LEDGERS` | One-shot migration flag. After the first read that triggers `ensure_migrated()` the legacy map is split and this flag is set to `true` to skip re-migration on every subsequent call. |
-| `(Symbol("rcv_hist"), Symbol)` | `Vec<RecoveryHistoryEntry>` | Persistent | `RECOVERY_TTL_LEDGERS` | Per-market completed recovery history, capped at `MAX_RECOVERY_HISTORY_PER_MARKET` (10) entries. Stored separately from active records so that appending history never interferes with the active-map write. |
+| `(Symbol("rcv_hist"), Symbol)` | `Vec<RecoveryHistoryEntry>` | Persistent | `RECOVERY_TTL_LEDGERS` | Per-market completed recovery history. Entries are append-only and are never removed by an admin operation. Stored separately from active records so that appending history never interferes with the active-map write. |
 | `Symbol("recovery_history")` | `Map<Symbol, Vec<RecoveryHistoryEntry>>` | Persistent | `RECOVERY_TTL_LEDGERS` | **Legacy — migration-only.** Holds the combined active-and-completed history before the v2 migration splits it into `recovery_records` (active) and `rcv_hist` (completed). After migration this key is removed and no longer written. Documented for completeness; existing entries from before the upgrade are migrated on first read. |
 
 ---
@@ -128,6 +128,7 @@ its call site(s), not just its name.
 | `UserLastBetTime(Symbol, Address)` | *(unused)* | Declared to support a per-(market, user) cool-off timer; no current call site. Per-entity data of this shape would need Persistent once wired up, matching `UserStake`. |
 | `CoolOffPeriod` | *(unused)* | Declared for a global cool-off period in seconds; no current call site. |
 | `PerMarketCoolOff(Symbol)` | *(unused)* | Declared for a per-market cool-off override; no current call site. |
+| `MaxOutcomesPerMarket` | Persistent | Admin-configurable cap on the number of outcomes a market may declare ([`markets.rs`](../src/markets.rs)). A single global config value read on every market creation, so it must survive across ledgers; extended to `MARKET_TTL_LEDGERS` alongside the markets it governs. Absent means `DEFAULT_MAX_OUTCOMES_PER_MARKET` (10) applies. |
 
 ### Dual-tier keys: `MarketMetadata` / `MarketScratch`
 

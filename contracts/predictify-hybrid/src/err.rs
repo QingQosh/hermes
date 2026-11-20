@@ -10,9 +10,34 @@ use soroban_sdk::{contracterror, contracttype, Address, Env, Map, String, Symbol
 ///
 /// Each discriminant is part of the client-facing contract API. Clients may
 /// persist these numbers or use them to decode failed invocations, so existing
-/// values must not be renumbered or reused. Add new variants with an explicit,
-/// previously unused value and update `tests/err_stability.rs` in the same
-/// change. A deliberate breaking change requires a versioned migration plan.
+/// values must not be renumbered or reused. A deliberate breaking change
+/// requires a versioned migration plan.
+///
+/// # Deprecation and pruning policy
+///
+/// This catalog is intentionally bounded. The following rules apply to every
+/// change that touches this enum:
+///
+/// 1. **Reachability required.** A variant may only be added if it is returned
+///    from at least one production entrypoint (or a function transitively
+///    called by one). Speculative or "reserved for future use" codes are not
+///    accepted.
+/// 2. **Explicit, unused codes only.** New variants must declare an explicit
+///    numeric discriminant that has never been used before. Codes are never
+///    renumbered and never reused, even after the variant that owned them is
+///    removed.
+/// 3. **Same-change documentation.** Adding or removing a variant requires
+///    updating `tests/err_stability.rs` (the pinned code table) and
+///    `docs/errors/predictify-hybrid.md` in the *same* change. A PR that
+///    touches this enum without those updates is rejected.
+/// 4. **Deprecate, then prune.** When a variant becomes unreachable (its last
+///    call site is deleted or refactored away), it is first marked
+///    `#[deprecated]` with a note pointing at the replacement. It stays in the
+///    enum for exactly one release cycle so downstream SDKs can migrate, and is
+///    then removed. Removal never renumbers the surviving variants.
+/// 5. **Audit cadence.** The catalog is re-audited against `src/` usages at
+///    least once per release cycle; the audit result is recorded in the
+///    changelog for that release.
 #[contracterror]
 #[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
 #[repr(u32)]
@@ -24,6 +49,9 @@ pub enum Error {
     InvalidCap = 674,
     /// The cool-off period is still active. Cannot unpause/resume the market.
     CoolOffPeriodActive = 675,
+    /// Delegation cap exceeded: a single address cannot hold more than 10 % of
+    /// total voting power through delegation.
+    DelegationCapExceeded = 676,
     // ===== USER OPERATION ERRORS (100-112) =====
     /// User is not authorized to perform the requested action. Typically returned when
     /// a non-admin attempts to call admin-only functions.
@@ -93,12 +121,23 @@ pub enum Error {
     /// placing another bet.  The cool-off window is configurable per-market or globally
     /// by the contract admin.
     BetCoolOffActive = 113,
+    /// The bet is outside the short cancellation window and can no longer be
+    /// cancelled. A bet may only be cancelled within
+    /// `get_bet_cancel_window` seconds of being placed; the locked stake then
+    /// stands until the market resolves.
+    ///
+    /// # Error Code
+    ///
+    /// Numeric value: `114`
+    BetCancellationWindowClosed = 114,
 
     // ===== ORACLE ERRORS =====
     /// The oracle service is unavailable. External data source may be temporarily
     /// down or unreachable.
     OracleUnavailable = 200,
-    /// The oracle configuration is invalid. Check oracle address, asset code, and other parameters.
+    /// The oracle configuration is missing or is the reserved "no oracle" sentinel.
+    /// Field-level rejections use `InvalidOracleProvider`, `InvalidOracleFeed`,
+    /// `InvalidThreshold`, or `InvalidComparison`.
     InvalidOracleConfig = 201,
     /// Oracle data is stale and exceeds the freshness threshold. Market resolution is delayed.
     OracleStale = 202,
@@ -114,7 +153,7 @@ pub enum Error {
     ResolutionTimeoutReached = 207,
     /// Oracle confidence interval is too wide. Accuracy threshold not met for reliable resolution.
     OracleConfidenceTooWide = 208,
-    /// Invalid oracle feed ID
+    /// Oracle feed ID is empty, unsupported, or malformed for the selected provider.
     InvalidOracleFeed = 209,
     /// Oracle callback authentication failed. Signature verification or authorization check failed.
     OracleCallbackAuthFailed = 210,
@@ -126,6 +165,8 @@ pub enum Error {
     OracleCallbackReplayDetected = 213,
     /// Oracle callback timeout. Response time exceeded maximum allowed duration.
     OracleCallbackTimeout = 214,
+    /// Oracle provider is not supported on the current network.
+    InvalidOracleProvider = 215,
 
     // ===== VALIDATION ERRORS =====
     /// Market question is empty or invalid. Question must be non-empty and descriptive.
@@ -328,6 +369,26 @@ pub enum Error {
     UserNotWhitelisted = 541,
     /// Market creator is blacklisted.
     CreatorBlacklisted = 542,
+
+    // ===== DELEGATION ERRORS (550-559) =====
+    /// Delegation not found for the specified delegator and delegate pair.
+    DelegationNotFound = 550,
+    /// Attempted to delegate to oneself. Self-delegation is not allowed.
+    DelegationSelfDelegation = 551,
+    /// Circular delegation detected. Delegation would create a circular chain (A->B->A).
+    DelegationCircular = 552,
+    /// Delegator already has a delegation to another address.
+    DelegationAlreadyExists = 553,
+    /// Delegate already has delegators assigned. Exceeds max delegations per account.
+    DelegationMaxExceeded = 554,
+    /// Delegation cooldown period is still active. Cannot revoke without waiting.
+    DelegationCooldownActive = 555,
+    /// Unauthorized delegation operation. Only delegator or delegate can modify the delegation.
+    DelegationUnauthorized = 556,
+    /// Delegation is expired and no longer valid.
+    DelegationExpired = 557,
+    /// Invalid delegation parameters provided.
+    DelegationInvalidParams = 558,
 }
 
 // ===== ERROR CATEGORIZATION AND RECOVERY SYSTEM =====
@@ -863,26 +924,15 @@ impl ErrorHandler {
                 RecoveryStrategy::Abort
             }
             Error::AdminNotSet | Error::DisputeFeeFailed => RecoveryStrategy::ManualIntervention,
-            Error::InvalidState | Error::InvalidOracleConfig => RecoveryStrategy::NoRecovery,
+            Error::InvalidState
+            | Error::InvalidOracleConfig
+            | Error::InvalidOracleProvider
+            | Error::InvalidOracleFeed => RecoveryStrategy::NoRecovery,
             Error::FeeExceedsMax => RecoveryStrategy::Retry,
             Error::BetExceedsCap => RecoveryStrategy::NoRecovery,
             Error::BetCoolOffActive => RecoveryStrategy::RetryWithDelay,
+            Error::BetCancellationWindowClosed => RecoveryStrategy::NoRecovery,
             Error::OperationWouldExceedBudget => RecoveryStrategy::NoRecovery,
-            // Limit errors driven by caller input: retrying with a smaller value works.
-            Error::BetAboveMaximum | Error::BatchEmpty | Error::BatchSizeExceeded => {
-                RecoveryStrategy::Retry
-            }
-            // Limit errors driven by admin configuration: an operator must fix the config.
-            Error::BetLimitsInverted
-            | Error::BetLimitAboveMaximum
-            | Error::BetCapOutOfRange
-            | Error::FeePercentageOutOfRange
-            | Error::FeeAmountAboveMaximum
-            | Error::CreationFeeOutOfRange
-            | Error::FeeLimitsInverted
-            | Error::QueueCapacityOutOfRange => RecoveryStrategy::Abort,
-            // Re-initialization is a benign no-op for the caller.
-            Error::QueueAlreadyInitialized => RecoveryStrategy::Skip,
             _ => RecoveryStrategy::Abort,
         }
     }
@@ -1287,7 +1337,10 @@ impl ErrorHandler {
             | Error::DisputeFeeFailed
             | Error::InvalidState
             | Error::InvalidOracleConfig
-            | Error::OperationWouldExceedBudget => 0,
+            | Error::InvalidOracleProvider
+            | Error::InvalidOracleFeed
+            | Error::OperationWouldExceedBudget
+            | Error::BetCancellationWindowClosed => 0,
             _ => 1,
         }
     }
@@ -1435,7 +1488,10 @@ impl ErrorHandler {
                 ErrorCategory::Validation,
                 RecoveryStrategy::Retry,
             ),
-            Error::InvalidOracleConfig | Error::OracleConfidenceTooWide => (
+            Error::InvalidOracleConfig
+            | Error::InvalidOracleProvider
+            | Error::InvalidOracleFeed
+            | Error::OracleConfidenceTooWide => (
                 ErrorSeverity::Medium,
                 ErrorCategory::Oracle,
                 RecoveryStrategy::NoRecovery,
@@ -1470,44 +1526,15 @@ impl ErrorHandler {
                 ErrorCategory::Financial,
                 RecoveryStrategy::NoRecovery,
             ),
-            Error::BetBelowMarketMin => (
+            Error::BetCancellationWindowClosed => (
                 ErrorSeverity::Low,
-                ErrorCategory::Financial,
+                ErrorCategory::UserOperation,
                 RecoveryStrategy::NoRecovery,
             ),
             Error::OperationWouldExceedBudget => (
                 ErrorSeverity::Critical,
                 ErrorCategory::System,
                 RecoveryStrategy::NoRecovery,
-            ),
-            // ===== Limit errors (600-611) =====
-            // Caller-supplied value out of bounds — the caller can resubmit a smaller value.
-            Error::BetAboveMaximum | Error::BatchEmpty | Error::BatchSizeExceeded => (
-                ErrorSeverity::Low,
-                ErrorCategory::Validation,
-                RecoveryStrategy::Retry,
-            ),
-            // Admin-supplied bound is itself invalid — the configuration must be corrected.
-            Error::BetLimitsInverted
-            | Error::BetLimitAboveMaximum
-            | Error::BetCapOutOfRange
-            | Error::QueueCapacityOutOfRange => (
-                ErrorSeverity::Medium,
-                ErrorCategory::Validation,
-                RecoveryStrategy::Abort,
-            ),
-            Error::FeePercentageOutOfRange
-            | Error::FeeAmountAboveMaximum
-            | Error::CreationFeeOutOfRange
-            | Error::FeeLimitsInverted => (
-                ErrorSeverity::Medium,
-                ErrorCategory::Financial,
-                RecoveryStrategy::Abort,
-            ),
-            Error::QueueAlreadyInitialized => (
-                ErrorSeverity::Low,
-                ErrorCategory::System,
-                RecoveryStrategy::Skip,
             ),
             _ => (
                 ErrorSeverity::Medium,
@@ -1619,6 +1646,7 @@ impl Error {
             }
             Error::InsufficientBalance => "Insufficient balance for operation",
             Error::BetCoolOffActive => "User is within the cool-off period; wait before placing another bet",
+            Error::BetCancellationWindowClosed => "Bet is outside the cancellation window and can no longer be cancelled",
             Error::InsufficientStorageRentBudget => "Insufficient storage rent for persistent key allocation",
             Error::OracleUnavailable => "Oracle is unavailable",
             Error::InvalidOracleConfig => "Invalid oracle configuration",
@@ -1649,7 +1677,6 @@ impl Error {
             Error::AdminNotSet => "Admin address not set",
             Error::FeeExceedsMax => "Fee is above the acceptable threshold",
             Error::BetExceedsCap => "Bet amount exceeds the per-market maximum bet cap",
-            Error::BetBelowMarketMin => "Bet amount is below the per-market minimum threshold",
             Error::OracleStale => "Oracle data is stale",
             Error::OracleNoConsensus => "Oracle consensus not reached",
             Error::OracleVerified => "Oracle result already verified",
@@ -1663,6 +1690,7 @@ impl Error {
             Error::OracleCallbackInvalidSignature => "Oracle callback signature invalid",
             Error::OracleCallbackReplayDetected => "Oracle callback replay detected",
             Error::OracleCallbackTimeout => "Oracle callback timed out",
+            Error::InvalidOracleProvider => "Oracle provider is not supported on this network",
             Error::InvalidStakeAmount => "Invalid Stake Amount",
             Error::SignerRotationCooldown => "Signer Rotation Cooldown Active",
             Error::RegistryFull => "Deprecated registry is full",
@@ -1697,7 +1725,9 @@ impl Error {
             Error::CBOpen => "Circuit breaker is open (operations blocked)",
             Error::CBError => "Generic circuit breaker subsystem error",
             Error::RateLimitExceeded => "Rate limit exceeded; too many requests in the time window",
-            Error::NoPendingFeeCommit => "No pending fee config commit found",
+            Error::NoPendingFeeCommit => {
+                "No pending fee commit found. Call commit_fee_config first."
+            }
             Error::FeeRevealTooEarly => "Fee config reveal attempted too early",
             Error::FeePreimageMismatch => "Preimage does not match the committed hash",
             Error::DisputeStakeCapExceeded => "Dispute stake cap exceeded for this address",
@@ -1739,6 +1769,7 @@ impl Error {
             Error::BetsAlreadyPlaced => "BETS_ALREADY_PLACED",
             Error::InsufficientBalance => "INSUFFICIENT_BALANCE",
             Error::BetCoolOffActive => "BET_COOL_OFF_ACTIVE",
+            Error::BetCancellationWindowClosed => "BET_CANCELLATION_WINDOW_CLOSED",
             Error::OracleUnavailable => "ORACLE_UNAVAILABLE",
             Error::InvalidOracleConfig => "INVALID_ORACLE_CONFIG",
             Error::GasBudgetExceeded => "GAS_BUDGET_EXCEEDED",
@@ -1768,7 +1799,6 @@ impl Error {
             Error::AdminNotSet => "ADMIN_NOT_SET",
             Error::FeeExceedsMax => "FEE_ABOVE_ACCEPTABLE",
             Error::BetExceedsCap => "BET_EXCEEDS_CAP",
-            Error::BetBelowMarketMin => "BET_BELOW_MARKET_MIN",
             Error::OracleStale => "ORACLE_STALE",
             Error::OracleNoConsensus => "ORACLE_NO_CONSENSUS",
             Error::OracleVerified => "ORACLE_VERIFIED",
@@ -1782,6 +1812,7 @@ impl Error {
             Error::OracleCallbackInvalidSignature => "ORACLE_CALLBACK_INVALID_SIGNATURE",
             Error::OracleCallbackReplayDetected => "ORACLE_CALLBACK_REPLAY_DETECTED",
             Error::OracleCallbackTimeout => "ORACLE_CALLBACK_TIMEOUT",
+            Error::InvalidOracleProvider => "INVALID_ORACLE_PROVIDER",
             Error::InvalidStakeAmount => "INVALID_STAKE_AMOUNT",
             Error::SignerRotationCooldown => "SIGNER_ROTATION_COOLDOWN",
             Error::RegistryFull => "REGISTRY_FULL",
